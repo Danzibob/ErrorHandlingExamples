@@ -3,7 +3,7 @@ from couchbase.cluster import PasswordAuthenticator
 from couchbase.n1ql    import N1QLQuery, N1QLError
 import couchbase.exceptions as CBErr
 import json
-from time import sleep
+from time import sleep, time
 
 import couchbase, logging
 couchbase.enable_logging() # allows us to see warnings for slow/orphaned operations
@@ -13,10 +13,19 @@ ch = logging.StreamHandler()
 ch.setLevel(logging.WARNING)
 logging.getLogger().addHandler(ch)
 
-cluster = Cluster('couchbase://10.143.191.101/')
+
+CONN_STR = 'couchbase://10.143.191.101,10.143.191.102,10.143.191.103'
+cluster = Cluster(CONN_STR)
 authenticator = PasswordAuthenticator('Danzibob', 'C0uchbase123')
 cluster.authenticate(authenticator)
 bucket = cluster.open_bucket('travel-sample')
+print("Connected.")
+
+# Threshold logging
+bucket.tracing_threshold_queue_flush_interval = 300000 # 5 minutes
+bucket.tracing_threshold_queue_size = 5
+bucket.tracing_threshold_kv = 5000 # 5 ms
+
 
 def getHint(err):
     return str(err).split(", ")[1]
@@ -63,14 +72,13 @@ Temporary Fail Error
 A Temporary Fail error is thrown when a server is running, but not able to service the request.
 For example, the server may still be starting up, or shutting down.
 ...
-The data requested is not available at all. Application should report the failure up the application stack.
+Retrying after a few seconds is probably the best strategy for this error
 """
 # First tries a normal get, and if the request times out, tries to get the replica
 def getNormalOrReplica(docID):
     try:
         result = bucket.get(docID)
-    # except (CBErr.TimeoutError, CBErr.CouchbaseNetworkError) as e:
-    except CBErr.CouchbaseNetworkError as e:
+    except (CBErr.TimeoutError, CBErr.CouchbaseNetworkError) as e:
         print("Unable to access node:", getHint(e))
         print("Trying a replica read")
         result = bucket.get(docID, replica=True)
@@ -82,7 +90,8 @@ def getNormalOrReplica(docID):
 
 # Gets with retries if first attempt fails.
 # Is blocking. Could be tweaked to use asyncio
-def getOrRetry(docID, retries=2, delay=100):
+# Could also add exponential backoff or smth.
+def getOrRetry(docID, retries=2, delay=1000):
     if retries <= -1: raise RetriesExceededException
     try:
         result = bucket.get(docID)
@@ -100,6 +109,7 @@ def getOrRetry(docID, retries=2, delay=100):
     return result
 
 # Retries twice then falls back to getting a replica
+# Is VERY slow to time out. Can we decrease the timeout? check the node is up? etc.
 def getRetryThenReplica(docID):
     try:
         result = getOrRetry(docID)
@@ -158,12 +168,19 @@ def upsertAndCheck(docID, value):
 # except Exception as e:
 #     print("Unexpected Exception:",e)
 
+# If server side failure is suspected, this function returns the set of nodes which are currently unavailable
+# The ping() and diagnotics() functions aren't documented anywhere?
+# Useful if there are some errors detected to determine whether to give up and fail gracefully
+def getDownNodes():
+    print(bucket.ping())
+    # What do the status numbers mean??
+    nodes = [x['server'].split(':')[0] for x in bucket.ping()['kv'] if x['status'] == 0 ]
 
 """
 Working with N1QL queries
 
 Using N1QL in the event of a node failure is less trivial than single document operations.
-If a node has failed entirely, the data requested may still be available if the relevant GSI is available and only indexed data is requested.
+If a node has failed entirely, the data requested may still be available if the relevant index is available and only pre-indexed data is requested.
 e.g. we have the airportname index on node, but the city index is on node 2.
 
 Trying to use an unavailable index will throw a HTTP 404 error, containing a message saying the index is missing.
@@ -172,7 +189,7 @@ It may be better just to run a rebalance or restart the node - thus bringing the
 Index replicas can also be used to prevent this problem (activated on index creation using WITH {"num_replica": 2})
 
 Even if the index is available, the document(s) in question may not be. This can cause a n1ql.N1QLError (even if most of the documents are available).
-    NB: THE ERROR ONLY HAPPENS WHEN YOU TRY TO UNPACK THE RESULTS
+    NB: initial query() call doesn't trigger the error; it's triggered on result access - presumably uses a generator
 
 (This works sometimes but usually times out...)
         A work-around here is to simplify the query to get only the document IDs from the index, then fetch the documents manually.
@@ -191,44 +208,41 @@ def N1QLFetchAirports(search, field='airportname'):
     param = "%" + search.lower() + "%"
     try:
         q = N1QLQuery(query, param)
-        res = bucket.n1ql_query(q)
-        for r in res:
-            print(r)
+        res = bucket.n1ql_query(q).execute()
     except N1QLError as e:
-        print(e)
         q = N1QLQuery(simple_query, param)
-        q.timeout = 300
-        docIDs = bucket.n1ql_query(q)
+        docMetas = bucket.n1ql_query(q)
+        ids = [meta['id'] for meta in docMetas]
         res = []
-        ids = []
-        # Unpacked seperately from handling to avoid query timing out (??)
-        for docMeta in docIDs:
-            ids.append(docMeta['id'])
-        for x in ids:
-            try:
-                # If it's known which buckets are down, possible to use get_multi
-                # Also valid to use anyway if we don't mind getting replicas even if an active copy is available
-                res.append(getNormalOrReplica(x))
-            except Exception as e:
-                print("Failed to get " + x)
-                print(e)
-        maxlen = max([len(r.value["airportname"]) for r in res])
-        for r in res:
-            print("{0:{2}} ({1})".format(r.value['airportname'], r.value['city'], maxlen + 2))
-    except Exception as e:
-        print("Exited with error:", e)
-    
+        try:
+            res = bucket.get_multi(ids)
+        except CBErr.CouchbaseNetworkError as e:
+            res = e.all_results
+            failed = [k for k,v in res.items() if v.value == None]
+            failedReplicas = bucket.get_multi(failed, replica=True)
+            # TODO: Check for failed gets here too
+            res.update(failedReplicas)
+    return res
 
-N1QLFetchAirports("per")
+
+res = N1QLFetchAirports("ard")
+maxlen = max([len(r.value["airportname"]) for k,r in res.items()])
+for k,r in res.items():
+    print("{0:{2}} ({1})".format(r.value['airportname'], r.value['city'], maxlen + 2))
+    print("...")
+    break
 #N1QLFetchAirports("per","city")
 
+# print("Printing Down Nodes")
+# print(getDownNodes())
+
+#print(bucket.get('airport_6716'))
 
 
 
-
-
-
-
+# [16807] Orphan responses observed: {"count":2,"service":"kv","top":[{"last_operation_id":"get:0x2f","last_remote_address":"10.143.191.102:11210","server_us":0,"total_us":3528275},{"last_operation_id":"get:0x38","last_remote_address":"10.143.191.102:11210","server_us":0,"total_us":2506062}]} (L:156)
+# [16807] Orphan responses observed: {"count":4,"service":"kv","top":[{"last_operation_id":"get:0x67","last_remote_address":"10.143.191.102:11210","server_us":0,"total_us":2505236},{"last_operation_id":"get:0x5b","last_remote_address":"10.143.191.102:11210","server_us":0,"total_us":2504019},{"last_operation_id":"get:0x62","last_remote_address":"10.143.191.102:11210","server_us"
+# After a few of these, started network error-ing instead?? Does sdk have this behaviour built in or was this activated by an external condition?
 
 
 
@@ -252,7 +266,10 @@ How else to deal with timeouts?
   Timeout diagnosis? (Support question?)
     - Network congestion
     - Host up, CBServer not; Host down; Server overloaded; etc...
-    - Conflicting info from server and sdk docs
+
+Per node error handling
+    ie check node for key/index/etc. and act based on if node is up
+    This is MUCH quicker than waiting for timeouts
 
 Possible network issues - causes & resolutions
   Some nodes disconnect: What errors? Replica reads
@@ -279,4 +296,7 @@ Network issues - check is_transient flag? handle similar to timeouts
 
 Other errors - Auth errors before cluster has fully started? (or sometimes if it's totally down)
 
+get_multi - exception tells you what failed
+    quiet param - check rc value
+    Allows to pick out successes & fails
 """
