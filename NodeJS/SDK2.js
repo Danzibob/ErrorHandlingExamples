@@ -192,6 +192,8 @@ Where a normal set would have succeeded just by getting into memory, the node co
 But a durable write would throw a failure or ambiguous response in this case, allowing you to deal with this issue
 */
 
+
+// This only works in a very specific case that is more effort than it's worth to implement in js
 function durableFieldIncrement(key, field, amount, callback, retry=0){
     if (retry > 5) return callback(new RetriesExceededError())
     bucket.get(key, (err, oldRes) => {
